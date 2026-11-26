@@ -1,0 +1,355 @@
+name: Build APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Create Android project
+        run: |
+          mkdir -p app/src/main/java/com/example/gptchat
+
+          cat > settings.gradle << 'GRADLE_EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "GPTChat"
+          include ':app'
+          GRADLE_EOF
+
+          cat > build.gradle << 'GRADLE_EOF'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+              id 'org.jetbrains.kotlin.android' version '1.9.24' apply false
+          }
+          GRADLE_EOF
+
+          echo "org.gradle.jvmargs=-Xmx3g" > gradle.properties
+
+          cat > app/build.gradle << 'GRADLE_EOF'
+          plugins {
+              id 'com.android.application'
+              id 'org.jetbrains.kotlin.android'
+          }
+
+          android {
+              namespace 'com.example.gptchat'
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId 'com.example.gptchat'
+                  minSdk 24
+                  targetSdk 34
+                  versionCode 1
+                  versionName '1.0'
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = '17'
+              }
+          }
+          GRADLE_EOF
+
+          cat > app/src/main/AndroidManifest.xml << 'XML_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <application
+                  android:label="GPT Chat"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:windowSoftInputMode="adjustResize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          XML_EOF
+
+          cat > app/src/main/java/com/example/gptchat/MainActivity.kt << 'KT_EOF'
+          package com.example.gptchat
+
+          import android.app.Activity
+          import android.app.AlertDialog
+          import android.content.Context
+          import android.graphics.Color
+          import android.graphics.drawable.GradientDrawable
+          import android.os.Bundle
+          import android.view.Gravity
+          import android.view.ViewGroup
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.net.HttpURLConnection
+          import java.net.URL
+
+          class MainActivity : Activity() {
+              private val defaultSystem = "Ты полезный ассистент. Отвечай кратко и по делу."
+              private val defaultModel = "gpt-4o-mini"
+              private val history = JSONArray()
+
+              private lateinit var chat: LinearLayout
+              private lateinit var scroll: ScrollView
+              private lateinit var input: EditText
+              private lateinit var sendBtn: Button
+
+              private val prefs by lazy { getSharedPreferences("cfg", Context.MODE_PRIVATE) }
+
+              private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+
+                  val match = ViewGroup.LayoutParams.MATCH_PARENT
+                  val wrap = ViewGroup.LayoutParams.WRAP_CONTENT
+
+                  val root = LinearLayout(this)
+                  root.orientation = LinearLayout.VERTICAL
+                  root.setBackgroundColor(Color.WHITE)
+
+                  // Верхняя панель
+                  val bar = LinearLayout(this)
+                  bar.orientation = LinearLayout.HORIZONTAL
+                  bar.gravity = Gravity.CENTER_VERTICAL
+                  bar.setPadding(dp(12), dp(8), dp(8), dp(8))
+
+                  val title = TextView(this)
+                  title.text = "GPT Chat"
+                  title.textSize = 20f
+                  title.setTextColor(Color.BLACK)
+                  bar.addView(title, LinearLayout.LayoutParams(0, wrap, 1f))
+
+                  val clearBtn = Button(this)
+                  clearBtn.text = "Очистить"
+                  clearBtn.setOnClickListener {
+                      while (history.length() > 0) history.remove(0)
+                      chat.removeAllViews()
+                  }
+                  bar.addView(clearBtn, LinearLayout.LayoutParams(wrap, wrap))
+
+                  val settingsBtn = Button(this)
+                  settingsBtn.text = "Настройки"
+                  settingsBtn.setOnClickListener { showSettings() }
+                  bar.addView(settingsBtn, LinearLayout.LayoutParams(wrap, wrap))
+
+                  root.addView(bar, LinearLayout.LayoutParams(match, wrap))
+
+                  // Сообщения
+                  scroll = ScrollView(this)
+                  chat = LinearLayout(this)
+                  chat.orientation = LinearLayout.VERTICAL
+                  chat.setPadding(dp(8), dp(8), dp(8), dp(8))
+                  scroll.addView(chat, ViewGroup.LayoutParams(match, wrap))
+                  root.addView(scroll, LinearLayout.LayoutParams(match, 0, 1f))
+
+                  // Ввод
+                  val row = LinearLayout(this)
+                  row.orientation = LinearLayout.HORIZONTAL
+                  row.gravity = Gravity.CENTER_VERTICAL
+                  row.setPadding(dp(8), dp(4), dp(8), dp(8))
+
+                  input = EditText(this)
+                  input.hint = "Сообщение"
+                  input.maxLines = 5
+                  row.addView(input, LinearLayout.LayoutParams(0, wrap, 1f))
+
+                  sendBtn = Button(this)
+                  sendBtn.text = "Отправить"
+                  sendBtn.setOnClickListener { send() }
+                  row.addView(sendBtn, LinearLayout.LayoutParams(wrap, wrap))
+
+                  root.addView(row, LinearLayout.LayoutParams(match, wrap))
+
+                  setContentView(root)
+
+                  if ((prefs.getString("key", "") ?: "").isBlank()) {
+                      root.post { showSettings() }
+                  }
+              }
+
+              private fun addBubble(text: String, user: Boolean): TextView {
+                  val tv = TextView(this)
+                  tv.text = text
+                  tv.textSize = 16f
+                  tv.setTextIsSelectable(true)
+                  tv.setTextColor(if (user) Color.WHITE else Color.BLACK)
+                  tv.setPadding(dp(12), dp(8), dp(12), dp(8))
+
+                  val bg = GradientDrawable()
+                  bg.cornerRadius = dp(14).toFloat()
+                  bg.setColor(Color.parseColor(if (user) "#2B7CD3" else "#E9E9EB"))
+                  tv.background = bg
+
+                  val lp = LinearLayout.LayoutParams(
+                      ViewGroup.LayoutParams.WRAP_CONTENT,
+                      ViewGroup.LayoutParams.WRAP_CONTENT
+                  )
+                  lp.gravity = if (user) Gravity.END else Gravity.START
+                  lp.setMargins(dp(if (user) 48 else 0), dp(4), dp(if (user) 0 else 48), dp(4))
+                  chat.addView(tv, lp)
+                  scroll.post { scroll.fullScroll(ScrollView.FOCUS_DOWN) }
+                  return tv
+              }
+
+              private fun showSettings() {
+                  val box = LinearLayout(this)
+                  box.orientation = LinearLayout.VERTICAL
+                  box.setPadding(dp(20), dp(8), dp(20), 0)
+
+                  fun field(hint: String, value: String): EditText {
+                      val e = EditText(this)
+                      e.hint = hint
+                      e.setText(value)
+                      box.addView(e)
+                      return e
+                  }
+
+                  val keyField = field("OpenAI API key (sk-...)", prefs.getString("key", "") ?: "")
+                  val modelField = field("Модель", prefs.getString("model", defaultModel) ?: defaultModel)
+                  val sysField = field("Системный промпт", prefs.getString("system", defaultSystem) ?: defaultSystem)
+
+                  AlertDialog.Builder(this)
+                      .setTitle("Настройки")
+                      .setView(box)
+                      .setPositiveButton("Сохранить") { _, _ ->
+                          prefs.edit()
+                              .putString("key", keyField.text.toString().trim())
+                              .putString("model", modelField.text.toString().trim().ifEmpty { defaultModel })
+                              .putString("system", sysField.text.toString().ifEmpty { defaultSystem })
+                              .apply()
+                      }
+                      .setNegativeButton("Отмена", null)
+                      .show()
+              }
+
+              private fun send() {
+                  val text = input.text.toString().trim()
+                  if (text.isEmpty()) return
+                  val key = prefs.getString("key", "") ?: ""
+                  if (key.isBlank()) {
+                      showSettings()
+                      return
+                  }
+
+                  input.setText("")
+                  addBubble(text, true)
+                  history.put(JSONObject().put("role", "user").put("content", text))
+                  val pending = addBubble("…", false)
+                  sendBtn.isEnabled = false
+
+                  // Собираем запрос в UI-потоке, чтобы не читать историю из фонового
+                  val body = buildBody()
+
+                  Thread {
+                      val result = runCatching { ask(key, body) }
+                      runOnUiThread {
+                          sendBtn.isEnabled = true
+                          val answer = result.getOrNull()
+                          if (answer != null) {
+                              pending.text = answer
+                              history.put(JSONObject().put("role", "assistant").put("content", answer))
+                          } else {
+                              pending.text = "Ошибка: " + (result.exceptionOrNull()?.message ?: "неизвестная ошибка")
+                              if (history.length() > 0) history.remove(history.length() - 1)
+                          }
+                          scroll.post { scroll.fullScroll(ScrollView.FOCUS_DOWN) }
+                      }
+                  }.start()
+              }
+
+              private fun buildBody(): JSONObject {
+                  val msgs = JSONArray()
+                  msgs.put(
+                      JSONObject()
+                          .put("role", "system")
+                          .put("content", prefs.getString("system", defaultSystem) ?: defaultSystem)
+                  )
+                  val start = maxOf(0, history.length() - 20)
+                  for (i in start until history.length()) msgs.put(history.get(i))
+                  return JSONObject()
+                      .put("model", prefs.getString("model", defaultModel) ?: defaultModel)
+                      .put("messages", msgs)
+              }
+
+              private fun ask(key: String, body: JSONObject): String {
+                  val conn = URL("https://api.openai.com/v1/chat/completions").openConnection() as HttpURLConnection
+                  conn.requestMethod = "POST"
+                  conn.connectTimeout = 20000
+                  conn.readTimeout = 120000
+                  conn.setRequestProperty("Authorization", "Bearer $key")
+                  conn.setRequestProperty("Content-Type", "application/json")
+                  conn.doOutput = true
+                  conn.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
+
+                  val code = conn.responseCode
+                  val stream = (if (code in 200..299) conn.inputStream else conn.errorStream)
+                      ?: throw Exception("HTTP $code")
+                  val raw = stream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+                  val json = JSONObject(raw)
+                  if (code !in 200..299) {
+                      throw Exception(json.optJSONObject("error")?.optString("message") ?: "HTTP $code")
+                  }
+                  return json.getJSONArray("choices")
+                      .getJSONObject(0)
+                      .getJSONObject("message")
+                      .getString("content")
+              }
+          }
+          KT_EOF
+
+      - name: Accept SDK licenses
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - name: Build APK
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - name: Save APK as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: GPTChat-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Publish APK to Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: GPT Chat build ${{ github.run_number }}
+          files: app/build/outputs/apk/debug/app-debug.apk
+concurrency: 
